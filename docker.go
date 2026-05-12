@@ -44,6 +44,10 @@ func main() {
                 Cleanup()
         case "exec":
                 execute()
+        case "exec-child":
+                execChild()
+        case "exec-intermediate":
+                execIntermediate()
         default:
                 panic("unknown command")
         }
@@ -251,6 +255,24 @@ func execute(){
 		return
 	}
 
+        cmd := exec.Command(os.Args[0],
+                append(
+                        []string{"exec-intermediate", os.Args[2]},
+                        os.Args[3:]...,
+                )...,)
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	err := cmd.Run()
+
+        if err!=nil{
+                fmt.Println("Error in creatig child exec",err)
+        }
+}
+
+func execIntermediate(){
+        runtime.LockOSThread()
         containerid:=os.Args[2]
 
         fd,err := os.ReadFile("container/"+containerid+"/config.json")
