@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -12,11 +13,20 @@ import (
 )
 
 type Container struct {
-        ID      string
-        PID     int
-        Status  string
-        Command []string
-        Created string
+    ID        string   `json:"id"`
+    PID       int      `json:"pid"`
+    Status    string   `json:"status"`
+    Command   []string `json:"command"`
+    Created   string   `json:"created"`
+    IP        string   `json:"ip"`        
+    Gateway   string   `json:"gateway"`   
+    HostVeth  string   `json:"hostVeth"`  
+}
+
+type NetworkState struct {
+    Subnet    string   `json:"subnet"`
+    Gateway   string   `json:"gateway"`
+    Allocated []string `json:"allocated"`
 }
 
 func main() {
@@ -53,7 +63,7 @@ func main() {
         }
 }
 
-func StoreMetadata(id string,location string,pid int){
+func StoreMetadata(id string,location string,pid int, containerIP string){
 
         Command := os.Args[2:]
         if os.Args[2] == "-d" {
@@ -66,6 +76,9 @@ func StoreMetadata(id string,location string,pid int){
                 Status: "Running",
                 Command:Command,    
                 Created: time.Now().String(),
+                Gateway:   "172.17.0.1",
+                IP: containerIP,
+                HostVeth: "veth-h-" + id[:8],
         }
 
         jsonData, err := json.MarshalIndent(data, "", "  ")
@@ -116,10 +129,6 @@ func CreateContainer(ID string) (string,error) {
                 return "", err
         }
 
-	if err != nil {
-		return "", fmt.Errorf("overlay mount: %w", err)
-	}
-
         fmt.Println("Overlay mounted at:", location+"/merged")
 
         return location, nil
@@ -165,6 +174,10 @@ func Cleanup(){
                 return
         }
 
+        if cfg.IP != "" {           
+                cleanupNetwork(id, cfg.IP)
+        }
+
         err = syscall.Unmount(location+"/merged",0)
         if err != nil {
                 fmt.Println("Unmount error:", err)
@@ -201,15 +214,15 @@ func stop() {
         var cfg Container
 
         err = json.Unmarshal(data, &cfg)
-        if cfg.Status == "Stopped" {
-                fmt.Println("Container already stopped")
-                return
-        }   
-
         if err != nil {
                 fmt.Println("Unmarshal error:", err)
                 return
         }
+
+        if cfg.Status == "Stopped" {
+                fmt.Println("Container already stopped")
+                return
+        }   
 
         process, err := os.FindProcess(cfg.PID)
         if err != nil {
@@ -399,6 +412,225 @@ func execChild() {
         }
 }
 
+func createBridge() error {
+
+        _, err := net.InterfaceByName("mini-docker0")
+        if err == nil {
+                return nil
+        }
+
+        err = exec.Command("ip","link","add","mini-docker0","type","bridge").Run()
+        if err != nil {
+                return fmt.Errorf("create bridge: %w", err)
+        } 
+
+        err = exec.Command("ip", "addr", "add","172.17.0.1/16", "dev", "mini-docker0").Run()
+        if err != nil {
+                return fmt.Errorf("bridge IP: %w", err)
+        }
+
+        err = exec.Command("ip", "link", "set","mini-docker0", "up").Run()
+        if err != nil {
+                return fmt.Errorf("bridge up: %w", err)
+        }
+
+        return nil
+}
+
+func setupVeth(containerID string, pid int, containerIP string) error {
+    hostVeth := "veth-h-" + containerID[:8]    
+    ctrVeth  := "veth-c-" + containerID[:8] 
+
+    err := exec.Command("ip", "link", "add",
+        hostVeth, "type", "veth",
+        "peer", "name", ctrVeth).Run()
+    if err != nil {
+        return fmt.Errorf("create veth: %w", err)
+    }
+
+    err = exec.Command("ip", "link", "set",
+        hostVeth, "master", "mini-docker0").Run()
+    if err != nil {
+        return fmt.Errorf("attach to bridge: %w", err)
+    }
+
+    err = exec.Command("ip", "link", "set",
+        hostVeth, "up").Run()
+    if err != nil {
+        return fmt.Errorf("veth host up: %w", err)
+    }
+
+    err = exec.Command("ip", "link", "set",
+        ctrVeth, "netns",
+        strconv.Itoa(pid)).Run()
+    if err != nil {
+        return fmt.Errorf("move to netns: %w", err)
+    }
+
+    err = exec.Command("nsenter",
+        "-t", strconv.Itoa(pid), "-n",
+        "ip", "addr", "add",
+        containerIP+"/16",
+        "dev", ctrVeth).Run()
+    if err != nil {
+        return fmt.Errorf("container IP: %w", err)
+    }
+
+    err = exec.Command("nsenter",
+        "-t", strconv.Itoa(pid), "-n",
+        "ip", "link", "set", ctrVeth, "up").Run()
+    if err != nil {
+        return fmt.Errorf("veth ctr up: %w", err)
+    }
+
+    err = exec.Command("nsenter",
+        "-t", strconv.Itoa(pid), "-n",
+        "ip", "link", "set", "lo", "up").Run()
+    if err != nil {
+        return fmt.Errorf("lo up: %w", err)
+    }
+
+    err = exec.Command("nsenter",
+        "-t", strconv.Itoa(pid), "-n",
+        "ip", "route", "add",
+        "default", "via", "172.17.0.1").Run()
+    if err != nil {
+        return fmt.Errorf("default route: %w", err)
+    }
+
+    return nil
+}
+
+func setupNAT() error {
+    err := os.WriteFile(
+        "/proc/sys/net/ipv4/ip_forward",
+        []byte("1"),
+        0644,
+    )
+    if err != nil {
+        return fmt.Errorf("ip_forward: %w", err)
+    }
+
+    checkCmd := exec.Command("iptables",
+        "-t", "nat",
+        "-C", "POSTROUTING",    
+        "-s", "172.17.0.0/16",
+        "!", "-o", "mini-docker0",
+        "-j", "MASQUERADE")
+
+    err = checkCmd.Run()
+    if err == nil {
+        return nil   
+    }
+
+    err = exec.Command("iptables",
+        "-t", "nat",
+        "-A", "POSTROUTING",
+        "-s", "172.17.0.0/16",
+        "!", "-o", "mini-docker0",
+        "-j", "MASQUERADE").Run()
+    if err != nil {
+        return fmt.Errorf("NAT rule: %w", err)
+    }
+
+    return nil
+}
+
+func loadNetworkState() NetworkState {
+
+    defaultState := NetworkState{
+        Subnet:    "172.17.0.0/16",
+        Gateway:   "172.17.0.1",
+        Allocated: []string{},
+    }
+
+    data, err := os.ReadFile("container/network.json")
+    if err != nil {
+        return defaultState
+    }
+
+    var state NetworkState
+    err = json.Unmarshal(data, &state)
+    if err != nil {
+        fmt.Println("Error parsing network state:", err)
+        return defaultState
+    }
+
+    return state
+}
+
+func saveNetworkState(state NetworkState) error {
+    err := os.MkdirAll("container", 0755)
+    if err != nil {
+        return fmt.Errorf("mkdir error: %w", err)
+    }
+
+    jsonData, err := json.MarshalIndent(state, "", "  ")
+    if err != nil {
+        return fmt.Errorf("marshal error: %w", err)
+    }
+
+    err = os.WriteFile("container/network.json", jsonData, 0644)
+    if err != nil {
+        return fmt.Errorf("write error: %w", err)
+    }
+
+    return nil
+}
+
+func contains(allocated []string, ip string) bool {
+    for _, a := range allocated {
+        if a == ip {
+            return true
+        }
+    }
+    return false
+}
+
+func remove(allocated []string, ip string) []string {
+    result := []string{}
+    for _, a := range allocated {
+        if a != ip {
+            result = append(result, a)
+        }
+    }
+    return result
+}
+
+func allocateIP() (string, error) {
+
+    state := loadNetworkState()
+
+    for i := 2; i < 255; i++ {
+        ip := fmt.Sprintf("172.17.0.%d", i)
+
+        if !contains(state.Allocated, ip) {
+            state.Allocated = append(state.Allocated, ip)
+            err := saveNetworkState(state)
+            if err!=nil{
+                return "", fmt.Errorf("save network state: %w", err)
+            }
+            return ip, nil
+        }
+    }
+
+    return "", fmt.Errorf("no IPs available")
+}
+
+func releaseIP(ip string) {
+    state := loadNetworkState()
+    state.Allocated = remove(state.Allocated, ip)
+    saveNetworkState(state)
+}
+
+func cleanupNetwork(containerID string, ip string) {
+    hostVeth := "veth-h-" + containerID[:6]
+
+    exec.Command("ip", "link", "del", hostVeth).Run()
+
+    releaseIP(ip)
+}
+
 func listContainers(){
         entries, err := os.ReadDir("container")
         if err != nil {
@@ -494,6 +726,27 @@ func run() {
                 return
         }
 
+        err = createBridge()
+
+        if err != nil {
+                fmt.Println("Bridge error:", err)
+                return
+        }
+
+        err = setupNAT()
+
+        if err != nil {
+                fmt.Println("NAT error:", err)
+                return
+        }
+
+        containerIP, err := allocateIP()
+
+        if err != nil {
+                fmt.Println("IP allocation error:", err)
+                return
+        }
+
         var cmd *exec.Cmd
         var detached bool = false
         var nullFile, stdoutLog, stderrLog *os.File
@@ -567,7 +820,14 @@ func run() {
                 stderrLog.Close()
         }
 
-        StoreMetadata(ID,location,cmd.Process.Pid)
+        err = setupVeth(ID, cmd.Process.Pid, containerIP)
+        if err != nil {
+                fmt.Println("Network setup error:", err)
+                releaseIP(containerIP)    
+                return
+        }
+
+        StoreMetadata(ID,location,cmd.Process.Pid, containerIP, )
 
         cGroup(cmd.Process.Pid,ID)
 
